@@ -1,1 +1,5 @@
 node_modules
+
+*-keypair.json
+
+docker-compose.*.yml

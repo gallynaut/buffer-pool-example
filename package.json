@@ -15,7 +15,8 @@
     "@switchboard-xyz/common": "^2.0.0",
     "@switchboard-xyz/switchboard-v2": "^0.0.132",
     "big.js": "^6.2.1",
-    "bn.js": "^5.2.1"
+    "bn.js": "^5.2.1",
+    "chalk": "4"
   },
   "devDependencies": {
     "@types/big.js": "^6.1.6",
