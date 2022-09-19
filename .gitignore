@@ -1,5 +1,6 @@
 node_modules
 
 *-keypair.json
+Buffer_Pool_Config.json
 
 docker-compose.*.yml

@@ -9,11 +9,33 @@ import { BN } from "bn.js";
 import fs from "fs";
 import path from "path";
 
-export async function findOrCreateDivvyKeypair(
-  connection: Connection
+/** Returns a promise that resolves successfully if returned before the given timeout has elapsed.
+ * @param ms the number of milliseconds before the promise expires
+ * @param promise the promise to wait for
+ * @param timeoutError the error to throw if the promise expires
+ * @return the promise result
+ */
+export async function promiseWithTimeout<T>(
+  ms: number,
+  promise: Promise<T>,
+  timeoutError = new Error("timeoutError")
+): Promise<T> {
+  // create a promise that rejects in milliseconds
+  const timeout = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      reject(timeoutError);
+    }, ms);
+  });
+
+  return Promise.race<T>([promise, timeout]);
+}
+
+export async function findOrCreateKeypair(
+  connection: Connection,
+  keypairName = "buffer-pool-keypair.json"
 ): Promise<Keypair> {
   const srcDir = __dirname;
-  const divvyKeypairPath = path.join(srcDir, "..", "divvy-keypair.json");
+  const divvyKeypairPath = path.join(srcDir, "..", keypairName);
   if (fs.existsSync(divvyKeypairPath)) {
     return Keypair.fromSecretKey(
       new Uint8Array(JSON.parse(fs.readFileSync(divvyKeypairPath, "utf-8")))
