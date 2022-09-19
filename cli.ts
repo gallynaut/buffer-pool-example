@@ -8,8 +8,14 @@ const { hideBin } = require("yargs/helpers");
 import fs from "fs";
 import path from "path";
 import chalk from "chalk";
-import { findOrCreateKeypair, jsonReplacers } from "./src/utils";
-import { Connection, PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
+import {
+  Connection,
+  Keypair,
+  LAMPORTS_PER_SOL,
+  PublicKey,
+  SystemProgram,
+  SYSVAR_CLOCK_PUBKEY,
+} from "@solana/web3.js";
 import {
   BufferRelayerAccount,
   CrankAccount,
@@ -18,6 +24,7 @@ import {
   OracleAccount,
   OracleQueueAccount,
   PermissionAccount,
+  ProgramStateAccount,
   programWallet,
   SwitchboardPermission,
   SwitchboardProgram,
@@ -26,6 +33,7 @@ import { BN } from "bn.js";
 import { OracleJob } from "@switchboard-xyz/common";
 import * as anchor from "@project-serum/anchor";
 import * as borsh from "@project-serum/borsh";
+import Big from "big.js";
 
 export const CHECK_ICON = chalk.green("\u2714");
 export const FAILED_ICON = chalk.red("\u2717");
@@ -170,17 +178,20 @@ secrets:
     "add [jobDefinition] [updateInterval]",
     "add a buffer relayer account to the pool",
     (y: any) => {
-      return y
-        .positional("jobDefinition", {
-          type: "string",
-          describe: "filesystem path to job definition file",
-          required: true,
-        })
-        .positional("updateInterval", {
-          type: "string",
-          describe: "minimum time between open round calls",
-          default: 30,
-        });
+      return (
+        y
+          // you could also use the same job public key to save time creating the same account each time
+          .positional("jobDefinition", {
+            type: "string",
+            describe: "filesystem path to job definition file",
+            required: true,
+          })
+          .positional("updateInterval", {
+            type: "string",
+            describe: "minimum time between open round calls",
+            default: 30,
+          })
+      );
     },
     async function (argv: any) {
       const { rpcUrl, jobDefinition, updateInterval } = argv;
@@ -212,34 +223,36 @@ secrets:
       }
       const oracleJob = OracleJob.fromObject(jobDef);
 
-      //   const [stateAccount, stateBump] = ProgramStateAccount.fromSeed(program);
-      //   const jobKeypair = Keypair.generate();
-      //   const data = Buffer.from(OracleJob.encodeDelimited(oracleJob).finish());
-      //   await program.methods
-      //     .jobInit({
-      //       name: Buffer.from(""),
-      //       expiration: new BN(0),
-      //       stateBump,
-      //       data,
-      //       size: data.byteLength,
-      //     })
-      //     .accounts({
-      //       job: jobKeypair.publicKey,
-      //       authority: payerKeypair.publicKey,
-      //       programState: stateAccount.publicKey,
-      //       payer: payerKeypair.publicKey,
-      //       systemProgram: SystemProgram.programId,
-      //     })
-      //     .signers([jobKeypair])
-      //     .rpc();
-      //   const jobAccount = new JobAccount({
-      //     program,
-      //     publicKey: jobKeypair.publicKey,
-      //   });
-      const jobAccount = await JobAccount.create(program, {
-        authority: payerKeypair.publicKey,
-        data: Buffer.from(OracleJob.encodeDelimited(oracleJob).finish()),
+      const [stateAccount, stateBump] = ProgramStateAccount.fromSeed(program);
+      const jobKeypair = Keypair.generate();
+      const data = Buffer.from(OracleJob.encodeDelimited(oracleJob).finish());
+      await program.methods
+        .jobInit({
+          name: Buffer.from(""),
+          expiration: new BN(0),
+          stateBump,
+          data,
+          size: data.byteLength,
+        })
+        .accounts({
+          job: jobKeypair.publicKey,
+          authority: payerKeypair.publicKey,
+          programState: stateAccount.publicKey,
+          payer: payerKeypair.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([jobKeypair])
+        .rpc();
+      const jobAccount = new JobAccount({
+        program,
+        publicKey: jobKeypair.publicKey,
       });
+
+      // Current bug in SDK, will be fixed by Tuesday 9/20
+      // const jobAccount = await JobAccount.create(program, {
+      //   authority: payerKeypair.publicKey,
+      //   data: Buffer.from(OracleJob.encodeDelimited(oracleJob).finish()),
+      // });
 
       const bufferAccount = await BufferRelayerAccount.create(program, {
         queueAccount,
@@ -430,4 +443,88 @@ export class SolanaClock {
     const clock = SolanaClock.decode(sysclockInfo.data);
     return clock;
   }
+}
+
+/** Returns a promise that resolves successfully if returned before the given timeout has elapsed.
+ * @param ms the number of milliseconds before the promise expires
+ * @param promise the promise to wait for
+ * @param timeoutError the error to throw if the promise expires
+ * @return the promise result
+ */
+export async function promiseWithTimeout<T>(
+  ms: number,
+  promise: Promise<T>,
+  timeoutError = new Error("timeoutError")
+): Promise<T> {
+  // create a promise that rejects in milliseconds
+  const timeout = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      reject(timeoutError);
+    }, ms);
+  });
+
+  return Promise.race<T>([promise, timeout]);
+}
+
+export async function findOrCreateKeypair(
+  connection: Connection,
+  keypairName = "buffer-pool-keypair.json"
+): Promise<Keypair> {
+  const srcDir = __dirname;
+  const divvyKeypairPath = path.join(srcDir, "..", keypairName);
+  if (fs.existsSync(divvyKeypairPath)) {
+    return Keypair.fromSecretKey(
+      new Uint8Array(JSON.parse(fs.readFileSync(divvyKeypairPath, "utf-8")))
+    );
+  }
+
+  const divvyKeypair = Keypair.generate();
+  fs.writeFileSync(divvyKeypairPath, `[${divvyKeypair.secretKey.toString()}]`);
+  // airdrop some funds
+  const { blockhash, lastValidBlockHeight } =
+    await connection.getLatestBlockhash();
+
+  const airdropTxn = await connection.requestAirdrop(
+    divvyKeypair.publicKey,
+    2 * LAMPORTS_PER_SOL
+  );
+  await connection.confirmTransaction({
+    signature: airdropTxn,
+    blockhash,
+    lastValidBlockHeight,
+  });
+
+  return divvyKeypair;
+}
+
+export const toUtf8 = (buf: any): string => {
+  buf = buf ?? "";
+  return Buffer.from(buf)
+    .toString("utf8")
+    .replace(/\u0000/g, "");
+};
+
+export function jsonReplacers(key: any, value: any): string {
+  if (key === "name" || (key === "metadata" && Array.isArray(value))) {
+    return toUtf8(Buffer.from(value));
+  }
+  // big.js
+  if (value instanceof Big) {
+    return value.toString();
+  }
+  // pubkey
+  if (value instanceof PublicKey) {
+    return value.toBase58();
+  }
+  // BN
+  if (BN.isBN(value)) {
+    return value.toString(10);
+  }
+  // bigint
+  if (typeof value === "bigint") {
+    return value.toString(10);
+  }
+
+  // Fall through for nested objects
+  return value;
 }
