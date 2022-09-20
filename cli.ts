@@ -471,21 +471,21 @@ export async function findOrCreateKeypair(
   keypairName = "buffer-pool-keypair.json"
 ): Promise<Keypair> {
   const srcDir = __dirname;
-  const divvyKeypairPath = path.join(srcDir, "..", keypairName);
-  if (fs.existsSync(divvyKeypairPath)) {
+  const keypairPath = path.join(srcDir, keypairName);
+  if (fs.existsSync(keypairPath)) {
     return Keypair.fromSecretKey(
-      new Uint8Array(JSON.parse(fs.readFileSync(divvyKeypairPath, "utf-8")))
+      new Uint8Array(JSON.parse(fs.readFileSync(keypairPath, "utf-8")))
     );
   }
 
-  const divvyKeypair = Keypair.generate();
-  fs.writeFileSync(divvyKeypairPath, `[${divvyKeypair.secretKey.toString()}]`);
+  const keypair = Keypair.generate();
+  fs.writeFileSync(keypairPath, `[${keypair.secretKey.toString()}]`);
   // airdrop some funds
   const { blockhash, lastValidBlockHeight } =
     await connection.getLatestBlockhash();
 
   const airdropTxn = await connection.requestAirdrop(
-    divvyKeypair.publicKey,
+    keypair.publicKey,
     2 * LAMPORTS_PER_SOL
   );
   await connection.confirmTransaction({
@@ -494,7 +494,7 @@ export async function findOrCreateKeypair(
     lastValidBlockHeight,
   });
 
-  return divvyKeypair;
+  return keypair;
 }
 
 export const toUtf8 = (buf: any): string => {
