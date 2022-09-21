@@ -5,6 +5,7 @@
 /* eslint-disable @typescript-eslint/no-var-requires */
 const yargs = require("yargs");
 const { hideBin } = require("yargs/helpers");
+import { waitFor } from "wait-for-event";
 import fs from "fs";
 import path from "path";
 import chalk from "chalk";
@@ -29,14 +30,37 @@ import {
   SwitchboardPermission,
   SwitchboardProgram,
 } from "@switchboard-xyz/switchboard-v2";
-import { BN } from "bn.js";
+import { BN, min } from "bn.js";
 import { OracleJob } from "@switchboard-xyz/common";
 import * as anchor from "@project-serum/anchor";
 import * as borsh from "@project-serum/borsh";
 import Big from "big.js";
+import EventEmitter from "events";
 
 export const CHECK_ICON = chalk.green("\u2714");
 export const FAILED_ICON = chalk.red("\u2717");
+
+export interface BufferRound {
+  numSuccess: number;
+  numError: number;
+  roundOpenSlot: anchor.BN;
+  roundOpenTimestamp: anchor.BN;
+  oraclePubkey: PublicKey;
+}
+
+export interface BufferState {
+  name: Uint8Array;
+  queuePubkey: PublicKey;
+  escrow: PublicKey;
+  authority: PublicKey;
+  jobPubkey: PublicKey;
+  jobHash: Uint8Array;
+  minUpdateDelaySeconds: number;
+  isLocked: boolean;
+  currentRound: BufferRound;
+  latestConfirmedRound: BufferRound;
+  result: Uint8Array;
+}
 
 yargs(hideBin(process.argv))
   .scriptName("buffer-pool")
@@ -223,36 +247,10 @@ secrets:
       }
       const oracleJob = OracleJob.fromObject(jobDef);
 
-      const [stateAccount, stateBump] = ProgramStateAccount.fromSeed(program);
-      const jobKeypair = Keypair.generate();
-      const data = Buffer.from(OracleJob.encodeDelimited(oracleJob).finish());
-      await program.methods
-        .jobInit({
-          name: Buffer.from(""),
-          expiration: new BN(0),
-          stateBump,
-          data,
-          size: data.byteLength,
-        })
-        .accounts({
-          job: jobKeypair.publicKey,
-          authority: payerKeypair.publicKey,
-          programState: stateAccount.publicKey,
-          payer: payerKeypair.publicKey,
-          systemProgram: SystemProgram.programId,
-        })
-        .signers([jobKeypair])
-        .rpc();
-      const jobAccount = new JobAccount({
-        program,
-        publicKey: jobKeypair.publicKey,
+      const jobAccount = await JobAccount.create(program, {
+        authority: payerKeypair.publicKey,
+        data: Buffer.from(OracleJob.encodeDelimited(oracleJob).finish()),
       });
-
-      // Current bug in SDK, will be fixed by Tuesday 9/20
-      // const jobAccount = await JobAccount.create(program, {
-      //   authority: payerKeypair.publicKey,
-      //   data: Buffer.from(OracleJob.encodeDelimited(oracleJob).finish()),
-      // });
 
       const bufferAccount = await BufferRelayerAccount.create(program, {
         queueAccount,
@@ -336,6 +334,145 @@ secrets:
       console.log(chalk.green("\u2714 ", "Open Round Signature", signature));
 
       process.exit(0);
+    }
+  )
+  .command(
+    "crank [minUpdateDelay]",
+    "watch a all buffer relayers and crank",
+    (y: any) => {
+      return y.positional("minUpdateDelay", {
+        type: "string",
+        describe: "minimum update time between cranks",
+        required: true,
+      });
+    },
+    async function (argv: any) {
+      const { rpcUrl, keypairPath, minUpdateDelay } = argv;
+      let { program, config } = await loadCli(rpcUrl);
+
+      const coder = new anchor.BorshAccountsCoder(program.idl);
+
+      if (minUpdateDelay) {
+        console.info(
+          `Overriding buffer settings, updating every ${minUpdateDelay} seconds`
+        );
+      }
+
+      // watch the solana clock
+      let solanaTime = (
+        await SolanaClock.fetch(program.provider.connection)
+      ).unixTimestamp.toNumber();
+      program.provider.connection.onAccountChange(
+        SYSVAR_CLOCK_PUBKEY,
+        (accountInfo) => {
+          const clock = SolanaClock.decode(accountInfo.data);
+          solanaTime = clock.unixTimestamp.toNumber();
+        }
+      );
+
+      if (!("buffers" in config)) {
+        throw new Error(`Failed to find buffers in config`);
+      }
+
+      const bufferAccounts = (config.buffers as string[]).map(
+        (pubkey) =>
+          new BufferRelayerAccount({
+            program,
+            publicKey: new PublicKey(pubkey),
+          })
+      );
+
+      const cache = new Map<
+        string,
+        { lastUpdateTime: number; nextUpdateTime: number }
+      >();
+      for await (const buffer of bufferAccounts) {
+        try {
+          const data: BufferState = await buffer.loadData();
+          cache.set(buffer.publicKey.toBase58(), {
+            lastUpdateTime: 0,
+            nextUpdateTime:
+              data.currentRound.roundOpenTimestamp.toNumber() +
+              (minUpdateDelay
+                ? Number.parseInt(minUpdateDelay)
+                : data.minUpdateDelaySeconds),
+          });
+
+          // watch account and update cache when state changes
+          program.provider.connection.onAccountChange(
+            buffer.publicKey,
+            (accountInfo) => {
+              const bufferState: BufferState = coder.decode(
+                BufferRelayerAccount.accountName,
+                accountInfo.data
+              );
+
+              const prev = cache.get(buffer.publicKey.toBase58())!;
+              cache.set(buffer.publicKey.toBase58(), {
+                lastUpdateTime: prev?.lastUpdateTime ?? 0,
+                nextUpdateTime:
+                  bufferState.currentRound.roundOpenTimestamp.toNumber() +
+                  (minUpdateDelay
+                    ? Number.parseInt(minUpdateDelay)
+                    : data.minUpdateDelaySeconds),
+              });
+
+              console.info(chalk.blue(`### ${buffer.publicKey.toBase58()}`));
+              console.info(CHECK_ICON, "Buffer state updated");
+              console.info(new Date().toString());
+              console.info(Buffer.from(bufferState.result).toString("utf-8"));
+            }
+          );
+        } catch (error) {
+          console.warn(
+            `Ignore buffer account ${buffer.publicKey}, failed to load account data. ${error}`
+          );
+        }
+      }
+
+      if (cache.size === 0) {
+        throw new Error(`Failed to load buffer pool`);
+      }
+
+      console.log(`Loaded ${cache.size} buffer accounts`);
+
+      setInterval(() => {
+        for (const [key, value] of cache.entries()) {
+          if (value.nextUpdateTime < solanaTime) {
+            // call open round
+            const bufferAccount = new BufferRelayerAccount({
+              program,
+              publicKey: new PublicKey(key),
+            });
+            bufferAccount
+              .openRound()
+              .then((sig) => {
+                console.info(
+                  chalk.blue(`### ${bufferAccount.publicKey.toBase58()}`)
+                );
+                console.info(CHECK_ICON, "OpenRound called successfully");
+                console.info(new Date().toString());
+                console.info(sig);
+                console.info(
+                  `https://explorer.solana.com/tx/${sig}?cluster=devnet`
+                );
+                const prev = cache.get(key)!;
+                cache.set(bufferAccount.publicKey.toBase58(), {
+                  lastUpdateTime: solanaTime,
+                  nextUpdateTime: prev.nextUpdateTime, // let websocket handle this value
+                });
+              })
+              .catch((error) =>
+                console.error(
+                  `Failed to update buffer account ${key}: ${error}`
+                )
+              );
+          }
+        }
+      }, 5000);
+
+      // wait forever
+      waitFor("", new EventEmitter());
     }
   )
   .command(

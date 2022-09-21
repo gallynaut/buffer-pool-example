@@ -34,7 +34,7 @@ Add a buffer relayer
 
 ```bash
 # buffer-pool add [JOBDEFINITION] [UPDATEINTERVAL]
-buffer-pool add jobs/todo/1.json 10
+buffer-pool add jobs/todo.1.json 30
 ```
 
 Start your oracle
