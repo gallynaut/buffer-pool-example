@@ -48,5 +48,11 @@ Request a buffer relayer update
 ```bash
 # buffer-pool update [BUFFERRELAYERPUBKEY]
 buffer-pool update ABr5bmaSTs958bWfaz7eFi16syx2YyTJG4J8tWYKyYo
+```
 
+Watch the pool of buffer relayers and call openRound when ready
+
+```bash
+# buffer-pool crank [UPDATEDELAY]
+buffer-pool crank 60
 ```
